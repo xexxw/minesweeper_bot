@@ -2,23 +2,31 @@
 Minesweeper Bot — Windows 11 Microsoft Minesweeper 自动化
 适用于高级模式 30x16, 99 颗雷
 
+使用方式:
+  1. 打开扫雷，开始一局高级模式（新游戏，还没点过任何格子）
+  2. 运行本程序
+  3. 按提示用鼠标点击棋盘左上角格子中心，按 F2 确认
+  4. 再点击棋盘右下角格子中心，按 F2 确认
+  5. 程序自动开始
+
 快捷键:
+  F2  — 确认鼠标位置（定位阶段）
   F9  — 暂停 / 继续
   F10 — 停止退出
 """
 
 import time
 import sys
-import threading
+import os
 import itertools
 from collections import defaultdict
 
 import pyautogui
 import numpy as np
-from PIL import ImageGrab
+from PIL import ImageGrab, ImageDraw
 
 try:
-    import keyboard  # 用于全局快捷键
+    import keyboard
     HAS_KEYBOARD = True
 except ImportError:
     HAS_KEYBOARD = False
@@ -31,44 +39,37 @@ ROWS, COLS, MINES = 16, 30, 99
 # 格子状态
 UNKNOWN = -1
 FLAGGED = -2
-EMPTY = 0  # 已打开，周围无雷
-
-# 颜色阈值 (RGB) — 针对 Microsoft Minesweeper 默认主题
-GREEN_DARK = np.array([74, 117, 44])
-GREEN_LIGHT = np.array([132, 175, 91])
-GREEN_TOLERANCE = 35
-
-BROWN_COLORS = [
-    np.array([215, 184, 153]),
-    np.array([229, 194, 159]),
-    np.array([187, 160, 125]),
-    np.array([200, 175, 145]),
-]
-BROWN_TOLERANCE = 40
-
-NUMBER_COLORS = {
-    1: (25, 118, 210),    # 蓝色
-    2: (56, 142, 60),     # 绿色
-    3: (211, 47, 47),     # 红色
-    4: (123, 31, 162),    # 紫色
-    5: (255, 143, 0),     # 橙色
-    6: (0, 151, 167),     # 青色
-    7: (66, 66, 66),      # 深灰
-    8: (158, 158, 158),   # 浅灰
-}
-NUMBER_TOLERANCE = 55
-
-FLAG_RED_RATIO = 0.15
+EMPTY = 0
 
 # pyautogui 设置
 pyautogui.PAUSE = 0.02
 pyautogui.FAILSAFE = True
 
+# 数字颜色 — 这些在大多数主题中比较稳定
+NUMBER_COLORS = {
+    1: (25, 118, 210),    # 蓝
+    2: (56, 142, 60),     # 绿
+    3: (211, 47, 47),     # 红
+    4: (123, 31, 162),    # 紫
+    5: (255, 143, 0),     # 橙
+    6: (0, 151, 167),     # 青
+    7: (66, 66, 66),      # 深灰
+    8: (158, 158, 158),   # 浅灰
+}
+NUMBER_TOLERANCE = 60
+
 # ---------------------------------------------------------------------------
-# 全局控制状态
+# 全局控制
 # ---------------------------------------------------------------------------
 paused = False
 stopped = False
+position_confirmed = False
+confirmed_pos = (0, 0)
+
+# 运行时从截图采样的颜色（不再硬编码）
+UNOPENED_COLORS = []  # 未打开格子的颜色（从左上角采样）
+OPENED_COLOR = None   # 已打开格子的颜色（运行中动态学习）
+COLOR_TOLERANCE = 35
 
 
 def on_pause():
@@ -86,18 +87,24 @@ def on_stop():
     print("\n*** 正在停止... ***")
 
 
+def on_confirm_position():
+    global position_confirmed, confirmed_pos
+    confirmed_pos = pyautogui.position()
+    position_confirmed = True
+
+
 def setup_hotkeys():
     if HAS_KEYBOARD:
         keyboard.add_hotkey('F9', on_pause)
         keyboard.add_hotkey('F10', on_stop)
-        print("快捷键已注册: F9=暂停/继续, F10=停止")
+        keyboard.add_hotkey('F2', on_confirm_position)
+        print("快捷键: F2=确认位置, F9=暂停/继续, F10=停止")
     else:
-        print("提示: 安装 keyboard 库可启用快捷键 (pip install keyboard)")
-        print("当前可通过将鼠标移到屏幕左上角来紧急停止")
+        print("错误: 需要 keyboard 库。请运行 pip install keyboard")
+        sys.exit(1)
 
 
 def wait_if_paused():
-    """如果暂停了就等待"""
     while paused and not stopped:
         time.sleep(0.1)
 
@@ -109,154 +116,137 @@ def color_distance(c1, c2):
     return np.sqrt(np.sum((np.array(c1, dtype=float) - np.array(c2, dtype=float)) ** 2))
 
 
-def is_green(pixel):
-    return (color_distance(pixel, GREEN_DARK) < GREEN_TOLERANCE or
-            color_distance(pixel, GREEN_LIGHT) < GREEN_TOLERANCE)
+def is_unopened(pixel):
+    """判断像素是否为未打开格子的颜色"""
+    for uc in UNOPENED_COLORS:
+        if color_distance(pixel, uc) < COLOR_TOLERANCE:
+            return True
+    return False
 
 
-def is_brown(pixel):
-    return any(color_distance(pixel, b) < BROWN_TOLERANCE for b in BROWN_COLORS)
+def is_opened(pixel):
+    """判断像素是否为已打开格子的颜色"""
+    if OPENED_COLOR is None:
+        return False
+    return color_distance(pixel, OPENED_COLOR) < COLOR_TOLERANCE
 
 
 def is_red(pixel):
-    r, g, b = pixel[0], pixel[1], pixel[2]
+    r, g, b = int(pixel[0]), int(pixel[1]), int(pixel[2])
     return r > 180 and g < 100 and b < 100
 
 
 # ---------------------------------------------------------------------------
-# 棋盘定位
+# 手动定位棋盘
 # ---------------------------------------------------------------------------
-def fast_locate_board(screenshot):
+def wait_for_position(prompt):
+    """等待用户移动鼠标到目标位置并按 F2 确认"""
+    global position_confirmed
+    position_confirmed = False
+    print(prompt)
+    print("  (移动鼠标到目标位置，按 F2 确认)")
+
+    while not position_confirmed and not stopped:
+        time.sleep(0.05)
+
+    if stopped:
+        return None
+    pos = confirmed_pos
+    print(f"  已确认: ({pos[0]}, {pos[1]})")
+    return pos
+
+
+def calibrate_board():
     """
-    通过网格密度分析定位棋盘。
-    扫雷棋盘的特征：绿色像素呈规则网格排列，密度高且均匀。
-    背景中的绿色（树木、壁纸等）密度不均匀。
+    让用户手动点击左上角和右下角格子来定位棋盘。
+    返回 (board_x, board_y, cell_size)
     """
-    img = np.array(screenshot)
-    h, w = img.shape[:2]
-
-    # 第一步：缩小扫描，建立绿色像素网格
-    scale = 4
-    small_h, small_w = h // scale, w // scale
-
-    # 用二维数组记录每个缩小格子是否为绿色
-    green_grid = np.zeros((small_h, small_w), dtype=bool)
-
-    for sy in range(small_h):
-        for sx in range(small_w):
-            y, x = sy * scale, sx * scale
-            if is_green(img[y, x]):
-                green_grid[sy, sx] = True
-
-    if np.sum(green_grid) < 30:
+    print()
+    print("=== 棋盘定位 ===")
+    print("请将鼠标移到棋盘【左上角第一个格子的中心】")
+    top_left = wait_for_position("  → 左上角格子中心:")
+    if top_left is None:
         return None
 
-    # 第二步：用滑动窗口找绿色密度最高的矩形区域
-    # 扫雷棋盘是 30:16 的宽高比 ≈ 1.875
-    # 在缩小后的图上，用行列密度分析找棋盘
-    # 对每一行统计绿色像素数
-    row_density = np.sum(green_grid, axis=1)
-    col_density = np.sum(green_grid, axis=0)
-
-    # 找行密度高的连续区域（棋盘所在的行）
-    row_threshold = small_w * 0.05  # 一行至少 5% 是绿色
-    col_threshold = small_h * 0.05
-
-    dense_rows = row_density > row_threshold
-    dense_cols = col_density > col_threshold
-
-    if not np.any(dense_rows) or not np.any(dense_cols):
+    print()
+    print("请将鼠标移到棋盘【右下角最后一个格子的中心】")
+    bottom_right = wait_for_position("  → 右下角格子中心:")
+    if bottom_right is None:
         return None
 
-    # 找最长的连续密集行段
-    def find_longest_run(arr):
-        best_start, best_len = 0, 0
-        start, length = 0, 0
-        for i, v in enumerate(arr):
-            if v:
-                if length == 0:
-                    start = i
-                length += 1
-                if length > best_len:
-                    best_start, best_len = start, length
-            else:
-                length = 0
-        return best_start, best_len
+    # 计算格子大小
+    # 左上角格子中心到右下角格子中心的距离 = (COLS-1) * cell_size 和 (ROWS-1) * cell_size
+    dx = bottom_right[0] - top_left[0]
+    dy = bottom_right[1] - top_left[1]
 
-    row_start, row_len = find_longest_run(dense_rows)
-    col_start, col_len = find_longest_run(dense_cols)
-
-    if row_len < 5 or col_len < 5:
-        return None
-
-    # 第三步：在候选区域内精确定位
-    # 只看密集区域内的绿色像素
-    candidate_top = row_start * scale
-    candidate_bottom = min(h - 1, (row_start + row_len) * scale)
-    candidate_left = col_start * scale
-    candidate_right = min(w - 1, (col_start + col_len) * scale)
-
-    # 在候选区域内进一步验证：检查绿色像素是否呈网格状
-    # 棋盘的绿色格子是交替的棋盘格，所以绿色像素应该有规律的间隔
-    exact_left, exact_right = candidate_right, candidate_left
-    exact_top, exact_bottom = candidate_bottom, candidate_top
-
-    for y in range(candidate_top, candidate_bottom + 1, 2):
-        for x in range(candidate_left, candidate_right + 1, 2):
-            if is_green(img[y, x]):
-                exact_left = min(exact_left, x)
-                exact_right = max(exact_right, x)
-                exact_top = min(exact_top, y)
-                exact_bottom = max(exact_bottom, y)
-
-    board_width = exact_right - exact_left + 1
-    board_height = exact_bottom - exact_top + 1
-
-    # 验证宽高比：30:16 ≈ 1.875，允许一定误差
-    ratio = board_width / max(board_height, 1)
-    expected_ratio = COLS / ROWS  # 1.875
-    if abs(ratio - expected_ratio) > 0.4:
-        # 宽高比不对，可能包含了背景绿色
-        # 尝试用宽高比修正：假设宽度正确，修正高度（或反之）
-        if ratio > expected_ratio:
-            # 太宽了，可能左右包含了背景
-            # 用高度推算正确宽度
-            corrected_width = int(board_height * expected_ratio)
-            center_x = (exact_left + exact_right) // 2
-            exact_left = center_x - corrected_width // 2
-            exact_right = exact_left + corrected_width
-        else:
-            # 太高了
-            corrected_height = int(board_width / expected_ratio)
-            center_y = (exact_top + exact_bottom) // 2
-            exact_top = center_y - corrected_height // 2
-            exact_bottom = exact_top + corrected_height
-
-        board_width = exact_right - exact_left + 1
-        board_height = exact_bottom - exact_top + 1
-
-    cell_w = board_width / COLS
-    cell_h = board_height / ROWS
+    cell_w = dx / (COLS - 1)
+    cell_h = dy / (ROWS - 1)
     cell_size = round((cell_w + cell_h) / 2)
 
-    if cell_size < 10 or cell_size > 100:
-        return None
+    # 棋盘左上角 = 左上角格子中心 - 半个格子
+    board_x = round(top_left[0] - cell_size / 2)
+    board_y = round(top_left[1] - cell_size / 2)
 
-    return exact_left, exact_top, cell_size
+    print()
+    print(f"  格子大小: {cell_size}px")
+    print(f"  棋盘左上角: ({board_x}, {board_y})")
+
+    return board_x, board_y, cell_size
+
+
+def sample_colors(screenshot, board_x, board_y, cell_size):
+    """
+    从截图中采样未打开格子的颜色。
+    扫雷棋盘格是深浅交替的，采样几个格子取颜色。
+    """
+    global UNOPENED_COLORS
+    img = np.array(screenshot)
+    colors = []
+
+    # 采样前几行几列的格子中心颜色
+    for r in range(min(3, ROWS)):
+        for c in range(min(4, COLS)):
+            cx = board_x + c * cell_size + cell_size // 2
+            cy = board_y + r * cell_size + cell_size // 2
+            if 0 <= cy < img.shape[0] and 0 <= cx < img.shape[1]:
+                # 取中心 3x3 区域平均色
+                radius = 2
+                y1 = max(0, cy - radius)
+                y2 = min(img.shape[0], cy + radius + 1)
+                x1 = max(0, cx - radius)
+                x2 = min(img.shape[1], cx + radius + 1)
+                avg = img[y1:y2, x1:x2].mean(axis=(0, 1))
+                colors.append(avg)
+
+    if not colors:
+        return
+
+    # 聚类：把相近的颜色合并（棋盘格通常有 2 种颜色）
+    unique = [colors[0]]
+    for c in colors[1:]:
+        is_new = True
+        for u in unique:
+            if color_distance(c, u) < 30:
+                is_new = False
+                break
+        if is_new:
+            unique.append(c)
+
+    UNOPENED_COLORS = unique[:4]  # 最多保留 4 种
+    print(f"  采样到 {len(UNOPENED_COLORS)} 种未打开格子颜色")
+    for i, c in enumerate(UNOPENED_COLORS):
+        print(f"    颜色{i+1}: RGB({int(c[0])}, {int(c[1])}, {int(c[2])})")
 
 
 def save_debug_image(screenshot, board_x, board_y, cell_size):
-    """保存调试图片，标注识别到的棋盘网格"""
-    from PIL import ImageDraw
+    """保存调试图片"""
     debug_img = screenshot.copy()
     draw = ImageDraw.Draw(debug_img)
 
-    # 画棋盘边框（红色）
     bw = cell_size * COLS
     bh = cell_size * ROWS
     draw.rectangle([board_x, board_y, board_x + bw, board_y + bh], outline='red', width=3)
 
-    # 画网格线（黄色）
     for r in range(ROWS + 1):
         y = board_y + r * cell_size
         draw.line([(board_x, y), (board_x + bw, y)], fill='yellow', width=1)
@@ -264,10 +254,9 @@ def save_debug_image(screenshot, board_x, board_y, cell_size):
         x = board_x + c * cell_size
         draw.line([(x, board_y), (x, board_y + bh)], fill='yellow', width=1)
 
-    import os
     debug_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug_board.png")
     debug_img.save(debug_path)
-    print(f"  调试图片已保存: {debug_path}")
+    print(f"  调试图片: {debug_path}")
     return debug_path
 
 
@@ -281,6 +270,7 @@ def get_cell_center(board_x, board_y, cell_size, row, col):
 
 
 def identify_cell(img_array, board_x, board_y, cell_size, row, col):
+    """识别单个格子状态"""
     cx, cy = get_cell_center(board_x, board_y, cell_size, row, col)
 
     sample_radius = max(2, cell_size // 6)
@@ -295,8 +285,8 @@ def identify_cell(img_array, board_x, board_y, cell_size, row, col):
 
     avg_color = region.mean(axis=(0, 1))
 
-    # 1. 未打开（绿色）
-    if is_green(avg_color):
+    # 1. 未打开（匹配采样到的颜色）
+    if is_unopened(avg_color):
         # 检查旗帜
         red_count = 0
         total = region.shape[0] * region.shape[1]
@@ -304,58 +294,11 @@ def identify_cell(img_array, board_x, board_y, cell_size, row, col):
             for px in range(region.shape[1]):
                 if is_red(region[py, px]):
                     red_count += 1
-        if total > 0 and red_count / total > FLAG_RED_RATIO:
+        if total > 0 and red_count / total > 0.15:
             return FLAGGED
         return UNKNOWN
 
-    # 2. 已打开
-    if is_brown(avg_color):
-        center_pixel = img_array[cy, cx]
-
-        if is_brown(center_pixel):
-            return EMPTY
-
-        best_num = None
-        best_dist = NUMBER_TOLERANCE
-        for num, nc in NUMBER_COLORS.items():
-            d = color_distance(center_pixel, nc)
-            if d < best_dist:
-                best_dist = d
-                best_num = num
-
-        if best_num is not None:
-            return best_num
-
-        # 扩大采样
-        sample_r2 = max(3, cell_size // 4)
-        sx1 = max(0, cx - sample_r2)
-        sy1 = max(0, cy - sample_r2)
-        sx2 = min(img_array.shape[1] - 1, cx + sample_r2)
-        sy2 = min(img_array.shape[0] - 1, cy + sample_r2)
-        larger_region = img_array[sy1:sy2 + 1, sx1:sx2 + 1]
-
-        non_brown_pixels = []
-        for py in range(larger_region.shape[0]):
-            for px in range(larger_region.shape[1]):
-                p = larger_region[py, px]
-                if not is_brown(p):
-                    non_brown_pixels.append(p)
-
-        if non_brown_pixels:
-            avg_non_brown = np.mean(non_brown_pixels, axis=0)
-            best_num = None
-            best_dist = NUMBER_TOLERANCE + 15
-            for num, nc in NUMBER_COLORS.items():
-                d = color_distance(avg_non_brown, nc)
-                if d < best_dist:
-                    best_dist = d
-                    best_num = num
-            if best_num is not None:
-                return best_num
-
-        return EMPTY
-
-    # 3. 其他颜色 — 尝试匹配数字
+    # 2. 尝试匹配数字颜色（中心像素）
     center_pixel = img_array[cy, cx]
     best_num = None
     best_dist = NUMBER_TOLERANCE
@@ -368,21 +311,50 @@ def identify_cell(img_array, board_x, board_y, cell_size, row, col):
     if best_num is not None:
         return best_num
 
-    return UNKNOWN
+    # 3. 扩大范围找数字
+    sample_r2 = max(3, cell_size // 4)
+    sx1 = max(0, cx - sample_r2)
+    sy1 = max(0, cy - sample_r2)
+    sx2 = min(img_array.shape[1] - 1, cx + sample_r2)
+    sy2 = min(img_array.shape[0] - 1, cy + sample_r2)
+    larger_region = img_array[sy1:sy2 + 1, sx1:sx2 + 1]
+
+    # 找非背景色像素
+    non_bg_pixels = []
+    for py in range(larger_region.shape[0]):
+        for px in range(larger_region.shape[1]):
+            p = larger_region[py, px]
+            if not is_unopened(p):
+                non_bg_pixels.append(p)
+
+    if non_bg_pixels:
+        avg_fg = np.mean(non_bg_pixels, axis=0)
+        best_num = None
+        best_dist = NUMBER_TOLERANCE + 20
+        for num, nc in NUMBER_COLORS.items():
+            d = color_distance(avg_fg, nc)
+            if d < best_dist:
+                best_dist = d
+                best_num = num
+        if best_num is not None:
+            return best_num
+
+    # 4. 不是未打开也不是数字 → 已打开空白
+    # 动态学习已打开格子的颜色
+    global OPENED_COLOR
+    if OPENED_COLOR is None:
+        OPENED_COLOR = avg_color
+    return EMPTY
 
 
 def read_board(screenshot, board_x, board_y, cell_size, known_flags=None):
-    """
-    读取整个棋盘状态。
-    known_flags: 已知的旗帜位置集合，用于补充截图识别不到的旗帜。
-    """
+    """读取整个棋盘"""
     img = np.array(screenshot)
     board = []
     for r in range(ROWS):
         row = []
         for c in range(COLS):
             val = identify_cell(img, board_x, board_y, cell_size, r, c)
-            # 如果内存中记录了这个格子是旗帜，但截图没识别出来，保留旗帜状态
             if known_flags and (r, c) in known_flags and val == UNKNOWN:
                 val = FLAGGED
             row.append(val)
@@ -406,6 +378,7 @@ def get_neighbors(r, c):
 
 
 def basic_solve(board):
+    """基础规则求解"""
     safe = set()
     mines = set()
 
@@ -430,6 +403,7 @@ def basic_solve(board):
 
 
 def constraint_solve(board):
+    """约束推理求解"""
     safe = set()
     mines = set()
 
@@ -490,6 +464,7 @@ def constraint_solve(board):
 
 
 def probability_guess(board):
+    """概率猜测"""
     unknown_cells = []
     for r in range(ROWS):
         for c in range(COLS):
@@ -498,20 +473,6 @@ def probability_guess(board):
 
     if not unknown_cells:
         return None
-
-    # 优先选靠近已开区域边缘的格子（有数字邻居的）
-    frontier = []
-    interior = []
-    for (r, c) in unknown_cells:
-        has_opened_neighbor = False
-        for nr, nc in get_neighbors(r, c):
-            if board[nr][nc] >= 0:
-                has_opened_neighbor = True
-                break
-        if has_opened_neighbor:
-            frontier.append((r, c))
-        else:
-            interior.append((r, c))
 
     danger = defaultdict(float)
     constraint_count = defaultdict(int)
@@ -533,36 +494,27 @@ def probability_guess(board):
                     constraint_count[cell] += 1
 
     avg_danger = {}
-    total_flags = sum(1 for r in range(ROWS) for c in range(COLS) if board[r][c] == FLAGGED)
-    remaining_mines = MINES - total_flags
-    remaining_unknown = len(unknown_cells)
-    global_prob = remaining_mines / remaining_unknown if remaining_unknown > 0 else 0.5
-
     for cell in unknown_cells:
         if cell in constraint_count and constraint_count[cell] > 0:
             avg_danger[cell] = danger[cell] / constraint_count[cell]
         else:
-            avg_danger[cell] = global_prob
+            total_flags = sum(1 for r in range(ROWS) for c in range(COLS) if board[r][c] == FLAGGED)
+            remaining_mines = MINES - total_flags
+            remaining_unknown = len(unknown_cells)
+            avg_danger[cell] = remaining_mines / max(remaining_unknown, 1)
 
     def priority(cell):
         r, c = cell
         d = avg_danger.get(cell, 0.5)
         is_corner = (r in (0, ROWS - 1)) and (c in (0, COLS - 1))
         is_edge = r in (0, ROWS - 1) or c in (0, COLS - 1)
-        pos_bonus = 0
         if is_corner:
-            pos_bonus = -0.05
+            d -= 0.05
         elif is_edge:
-            pos_bonus = -0.02
-        return d + pos_bonus
+            d -= 0.02
+        return d
 
-    # 优先从 frontier 中选（信息更多），如果 frontier 都很危险就选 interior
-    candidates = frontier if frontier else interior
-    if not candidates:
-        candidates = unknown_cells
-
-    best = min(candidates, key=priority)
-    return best
+    return min(unknown_cells, key=priority)
 
 
 # ---------------------------------------------------------------------------
@@ -603,11 +555,7 @@ def is_game_over(board, prev_board):
         return True, "WIN"
 
     if prev_board is not None:
-        changes = 0
-        for r in range(ROWS):
-            for c in range(COLS):
-                if board[r][c] != prev_board[r][c]:
-                    changes += 1
+        changes = sum(1 for r in range(ROWS) for c in range(COLS) if board[r][c] != prev_board[r][c])
         if changes > ROWS * COLS * 0.3:
             return True, "LOSE"
 
@@ -617,21 +565,6 @@ def is_game_over(board, prev_board):
 # ---------------------------------------------------------------------------
 # 主程序
 # ---------------------------------------------------------------------------
-def print_board(board):
-    symbols = {UNKNOWN: '.', FLAGGED: 'F', EMPTY: ' '}
-    print("   " + "".join(f"{c:2d}" for c in range(COLS)))
-    print("   " + "--" * COLS)
-    for r in range(ROWS):
-        row_str = f"{r:2d}|"
-        for c in range(COLS):
-            v = board[r][c]
-            if v in symbols:
-                row_str += f" {symbols[v]}"
-            else:
-                row_str += f" {v}"
-        print(row_str)
-
-
 def main():
     global stopped
 
@@ -643,61 +576,64 @@ def main():
 
     setup_hotkeys()
     print()
-    print("请先打开 Microsoft Minesweeper 并开始一局高级模式游戏。")
-    print("确保扫雷窗口完整可见，不要被遮挡。")
+    print("请先打开扫雷，开始一局高级模式新游戏（不要点任何格子）。")
     print()
-    input("准备好后按回车键开始 >>> ")
-    print()
-    print("3 秒后开始，请切换到扫雷窗口...")
-    for i in range(3, 0, -1):
-        print(f"  {i}...")
-        time.sleep(1)
-    print("  开始!")
-    print()
+    input("准备好后按回车键开始定位 >>> ")
 
-    # 截图并定位棋盘
-    print("[1] 截图定位棋盘...")
-    screenshot = ImageGrab.grab()
-    board_info = fast_locate_board(screenshot)
-
+    # 手动定位棋盘
+    board_info = calibrate_board()
     if board_info is None:
-        print("错误：无法定位扫雷棋盘！")
-        print("请确保：")
-        print("  1. Microsoft Minesweeper 已打开且可见")
-        print("  2. 正在进行高级模式 (30x16) 游戏")
-        print("  3. 使用默认主题（绿色格子）")
-        print("  4. 棋盘没有被其他窗口遮挡")
-        input("按回车键退出...")
-        sys.exit(1)
+        print("已取消。")
+        sys.exit(0)
 
     board_x, board_y, cell_size = board_info
-    print(f"  棋盘位置: ({board_x}, {board_y}), 格子大小: {cell_size}px")
 
-    # 保存调试图片，让用户确认定位是否正确
+    # 截图采样颜色
+    print()
+    print("[1] 采样格子颜色...")
+    screenshot = ImageGrab.grab()
+    sample_colors(screenshot, board_x, board_y, cell_size)
+
+    # 保存调试图
     save_debug_image(screenshot, board_x, board_y, cell_size)
     print()
-    print("请检查 debug_board.png 确认棋盘定位是否正确。")
-    resp = input("定位正确吗？(y=继续 / n=退出) >>> ").strip().lower()
-    if resp != 'y' and resp != 'yes' and resp != '':
-        print("已退出。请调整窗口位置后重试。")
+    resp = input("请查看 debug_board.png 确认网格对齐。继续? (y/n) >>> ").strip().lower()
+    if resp == 'n':
+        print("已退出。")
         sys.exit(0)
-    print()
 
     # 内存中跟踪已标旗的格子
     known_flags = set()
 
-    # 第一次点击：棋盘中心（左键点开）
-    print("[2] 第一次点击（棋盘中心，左键点开）...")
+    # 第一次点击：棋盘中心
+    print()
+    print("[2] 第一次点击（棋盘中心）...")
     center_r, center_c = ROWS // 2, COLS // 2
     click_cell(board_x, board_y, cell_size, center_r, center_c, button='left')
-    time.sleep(0.5)
+    time.sleep(0.8)
+
+    # 点击后重新截图，学习已打开格子的颜色
+    screenshot2 = ImageGrab.grab()
+    img2 = np.array(screenshot2)
+    # 中心格子应该已经打开了，采样它的颜色作为"已打开"颜色
+    cx, cy = get_cell_center(board_x, board_y, cell_size, center_r, center_c)
+    if 0 <= cy < img2.shape[0] and 0 <= cx < img2.shape[1]:
+        radius = 3
+        y1 = max(0, cy - radius)
+        y2 = min(img2.shape[0], cy + radius + 1)
+        x1 = max(0, cx - radius)
+        x2 = min(img2.shape[1], cx + radius + 1)
+        global OPENED_COLOR
+        OPENED_COLOR = img2[y1:y2, x1:x2].mean(axis=(0, 1))
+        print(f"  已打开格子颜色: RGB({int(OPENED_COLOR[0])}, {int(OPENED_COLOR[1])}, {int(OPENED_COLOR[2])})")
 
     prev_board = None
     turn = 0
     stale_count = 0
     max_stale = 5
 
-    print("[3] 开始自动求解循环...")
+    print()
+    print("[3] 开始自动求解...")
     print()
 
     while not stopped:
@@ -708,7 +644,6 @@ def main():
         turn += 1
         print(f"--- 第 {turn} 轮 ---")
 
-        # 截图识别
         time.sleep(0.15)
         screenshot = ImageGrab.grab()
         board = read_board(screenshot, board_x, board_y, cell_size, known_flags)
@@ -716,7 +651,6 @@ def main():
         unknown, flagged, opened = count_states(board)
         print(f"  未知: {unknown}, 旗帜: {flagged}, 已开: {opened}")
 
-        # 检测游戏结束
         game_over, result = is_game_over(board, prev_board)
         if game_over:
             print()
@@ -728,7 +662,6 @@ def main():
 
         # 求解
         safe, mines_found = basic_solve(board)
-
         if not safe and not mines_found:
             safe, mines_found = constraint_solve(board)
 
@@ -743,7 +676,7 @@ def main():
                 click_cell(board_x, board_y, cell_size, r, c, button='left')
                 actions += 1
 
-        # 然后右键标旗
+        # 然后标旗
         for r, c in mines_found:
             if stopped:
                 break
@@ -755,7 +688,6 @@ def main():
                 actions += 1
 
         if actions == 0:
-            # 没有确定解，概率猜测（左键点开）
             guess = probability_guess(board)
             if guess is None:
                 print("  没有可操作的格子，结束。")
@@ -768,11 +700,10 @@ def main():
         else:
             print(f"  执行了 {actions} 个操作 (点开: {len(safe)}, 标雷: {len(mines_found)})")
 
-        # 检测是否卡住
         if prev_board is not None and board == prev_board:
             stale_count += 1
             if stale_count >= max_stale:
-                print("  棋盘状态连续无变化，尝试概率猜测...")
+                print("  连续无变化，强制猜测...")
                 guess = probability_guess(board)
                 if guess:
                     r, c = guess
