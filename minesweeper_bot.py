@@ -127,42 +127,82 @@ def is_red(pixel):
 # 棋盘定位
 # ---------------------------------------------------------------------------
 def fast_locate_board(screenshot):
+    """
+    通过网格密度分析定位棋盘。
+    扫雷棋盘的特征：绿色像素呈规则网格排列，密度高且均匀。
+    背景中的绿色（树木、壁纸等）密度不均匀。
+    """
     img = np.array(screenshot)
     h, w = img.shape[:2]
 
+    # 第一步：缩小扫描，建立绿色像素网格
     scale = 4
     small_h, small_w = h // scale, w // scale
 
-    green_xs = []
-    green_ys = []
+    # 用二维数组记录每个缩小格子是否为绿色
+    green_grid = np.zeros((small_h, small_w), dtype=bool)
 
     for sy in range(small_h):
         for sx in range(small_w):
             y, x = sy * scale, sx * scale
-            pixel = img[y, x]
-            if is_green(pixel):
-                green_xs.append(x)
-                green_ys.append(y)
+            if is_green(img[y, x]):
+                green_grid[sy, sx] = True
 
-    if len(green_xs) < 50:
+    if np.sum(green_grid) < 30:
         return None
 
-    rough_left = min(green_xs)
-    rough_right = max(green_xs)
-    rough_top = min(green_ys)
-    rough_bottom = max(green_ys)
+    # 第二步：用滑动窗口找绿色密度最高的矩形区域
+    # 扫雷棋盘是 30:16 的宽高比 ≈ 1.875
+    # 在缩小后的图上，用行列密度分析找棋盘
+    # 对每一行统计绿色像素数
+    row_density = np.sum(green_grid, axis=1)
+    col_density = np.sum(green_grid, axis=0)
 
-    margin = scale * 2
-    fine_left = max(0, rough_left - margin)
-    fine_right = min(w - 1, rough_right + margin)
-    fine_top = max(0, rough_top - margin)
-    fine_bottom = min(h - 1, rough_bottom + margin)
+    # 找行密度高的连续区域（棋盘所在的行）
+    row_threshold = small_w * 0.05  # 一行至少 5% 是绿色
+    col_threshold = small_h * 0.05
 
-    exact_left, exact_right = fine_right, fine_left
-    exact_top, exact_bottom = fine_bottom, fine_top
+    dense_rows = row_density > row_threshold
+    dense_cols = col_density > col_threshold
 
-    for y in range(fine_top, fine_bottom + 1):
-        for x in range(fine_left, fine_right + 1):
+    if not np.any(dense_rows) or not np.any(dense_cols):
+        return None
+
+    # 找最长的连续密集行段
+    def find_longest_run(arr):
+        best_start, best_len = 0, 0
+        start, length = 0, 0
+        for i, v in enumerate(arr):
+            if v:
+                if length == 0:
+                    start = i
+                length += 1
+                if length > best_len:
+                    best_start, best_len = start, length
+            else:
+                length = 0
+        return best_start, best_len
+
+    row_start, row_len = find_longest_run(dense_rows)
+    col_start, col_len = find_longest_run(dense_cols)
+
+    if row_len < 5 or col_len < 5:
+        return None
+
+    # 第三步：在候选区域内精确定位
+    # 只看密集区域内的绿色像素
+    candidate_top = row_start * scale
+    candidate_bottom = min(h - 1, (row_start + row_len) * scale)
+    candidate_left = col_start * scale
+    candidate_right = min(w - 1, (col_start + col_len) * scale)
+
+    # 在候选区域内进一步验证：检查绿色像素是否呈网格状
+    # 棋盘的绿色格子是交替的棋盘格，所以绿色像素应该有规律的间隔
+    exact_left, exact_right = candidate_right, candidate_left
+    exact_top, exact_bottom = candidate_bottom, candidate_top
+
+    for y in range(candidate_top, candidate_bottom + 1, 2):
+        for x in range(candidate_left, candidate_right + 1, 2):
             if is_green(img[y, x]):
                 exact_left = min(exact_left, x)
                 exact_right = max(exact_right, x)
@@ -172,6 +212,29 @@ def fast_locate_board(screenshot):
     board_width = exact_right - exact_left + 1
     board_height = exact_bottom - exact_top + 1
 
+    # 验证宽高比：30:16 ≈ 1.875，允许一定误差
+    ratio = board_width / max(board_height, 1)
+    expected_ratio = COLS / ROWS  # 1.875
+    if abs(ratio - expected_ratio) > 0.4:
+        # 宽高比不对，可能包含了背景绿色
+        # 尝试用宽高比修正：假设宽度正确，修正高度（或反之）
+        if ratio > expected_ratio:
+            # 太宽了，可能左右包含了背景
+            # 用高度推算正确宽度
+            corrected_width = int(board_height * expected_ratio)
+            center_x = (exact_left + exact_right) // 2
+            exact_left = center_x - corrected_width // 2
+            exact_right = exact_left + corrected_width
+        else:
+            # 太高了
+            corrected_height = int(board_width / expected_ratio)
+            center_y = (exact_top + exact_bottom) // 2
+            exact_top = center_y - corrected_height // 2
+            exact_bottom = exact_top + corrected_height
+
+        board_width = exact_right - exact_left + 1
+        board_height = exact_bottom - exact_top + 1
+
     cell_w = board_width / COLS
     cell_h = board_height / ROWS
     cell_size = round((cell_w + cell_h) / 2)
@@ -180,6 +243,32 @@ def fast_locate_board(screenshot):
         return None
 
     return exact_left, exact_top, cell_size
+
+
+def save_debug_image(screenshot, board_x, board_y, cell_size):
+    """保存调试图片，标注识别到的棋盘网格"""
+    from PIL import ImageDraw
+    debug_img = screenshot.copy()
+    draw = ImageDraw.Draw(debug_img)
+
+    # 画棋盘边框（红色）
+    bw = cell_size * COLS
+    bh = cell_size * ROWS
+    draw.rectangle([board_x, board_y, board_x + bw, board_y + bh], outline='red', width=3)
+
+    # 画网格线（黄色）
+    for r in range(ROWS + 1):
+        y = board_y + r * cell_size
+        draw.line([(board_x, y), (board_x + bw, y)], fill='yellow', width=1)
+    for c in range(COLS + 1):
+        x = board_x + c * cell_size
+        draw.line([(x, board_y), (x, board_y + bh)], fill='yellow', width=1)
+
+    import os
+    debug_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug_board.png")
+    debug_img.save(debug_path)
+    print(f"  调试图片已保存: {debug_path}")
+    return debug_path
 
 
 # ---------------------------------------------------------------------------
@@ -583,6 +672,16 @@ def main():
 
     board_x, board_y, cell_size = board_info
     print(f"  棋盘位置: ({board_x}, {board_y}), 格子大小: {cell_size}px")
+
+    # 保存调试图片，让用户确认定位是否正确
+    save_debug_image(screenshot, board_x, board_y, cell_size)
+    print()
+    print("请检查 debug_board.png 确认棋盘定位是否正确。")
+    resp = input("定位正确吗？(y=继续 / n=退出) >>> ").strip().lower()
+    if resp != 'y' and resp != 'yes' and resp != '':
+        print("已退出。请调整窗口位置后重试。")
+        sys.exit(0)
+    print()
 
     # 内存中跟踪已标旗的格子
     known_flags = set()
