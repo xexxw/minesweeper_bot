@@ -26,18 +26,12 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Build exe
+      - name: Build exe with Tesseract bundled
         run: |
-          pyinstaller --onefile minesweeper_bot.py
+          pyinstaller --onefile --add-data "C:\Program Files\Tesseract-OCR;Tesseract-OCR" minesweeper_bot.py
 
-      - name: Package Tesseract with exe
-        run: |
-          Copy-Item -Recurse "C:\Program Files\Tesseract-OCR" dist\Tesseract-OCR
-
-      - name: Upload exe with Tesseract
+      - name: Upload exe
         uses: actions/upload-artifact@v4
         with:
           name: minesweeper_bot
-          path: |
-            dist/minesweeper_bot.exe
-            dist/Tesseract-OCR/
+          path: dist/minesweeper_bot.exe

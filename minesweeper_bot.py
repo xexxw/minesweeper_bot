@@ -139,18 +139,20 @@ def setup_tesseract():
         print("错误: 需要 pytesseract 库。请运行 pip install pytesseract")
         sys.exit(1)
 
-    # 打包后的 exe 同目录下
+    # PyInstaller 打包后解压的临时目录
     if getattr(sys, 'frozen', False):
-        base = os.path.dirname(sys.executable)
+        base = sys._MEIPASS
+        exe_dir = os.path.dirname(sys.executable)
     else:
         base = os.path.dirname(os.path.abspath(__file__))
+        exe_dir = base
 
     candidates = [
-        os.path.join(base, 'tesseract', 'tesseract.exe'),
-        os.path.join(base, 'Tesseract-OCR', 'tesseract.exe'),
+        os.path.join(base, 'Tesseract-OCR', 'tesseract.exe'),      # 打包在 exe 内
+        os.path.join(exe_dir, 'Tesseract-OCR', 'tesseract.exe'),    # exe 同目录
+        os.path.join(exe_dir, 'tesseract', 'tesseract.exe'),
         r'C:\Program Files\Tesseract-OCR\tesseract.exe',
         r'C:\Program Files (x86)\Tesseract-OCR\tesseract.exe',
-        'tesseract',  # PATH 中
     ]
 
     for path in candidates:
@@ -172,7 +174,6 @@ def setup_tesseract():
 
     print("错误: 找不到 Tesseract OCR。")
     print("请安装 Tesseract: https://github.com/tesseract-ocr/tesseract")
-    print("或将 tesseract.exe 放在程序同目录的 Tesseract-OCR 文件夹中。")
     sys.exit(1)
 
 
