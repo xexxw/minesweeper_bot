@@ -45,10 +45,12 @@ EMPTY = 0
 pyautogui.PAUSE = 0.02
 pyautogui.FAILSAFE = True
 
-# 数字颜色 — 运行时从截图学习，不再硬编码
-# key=数字, value=RGB tuple
+# 数字颜色 — 用 HSV 色相范围识别，适配各种主题
+# 扫雷数字颜色在不同主题中色相基本一致:
+#   1=蓝, 2=绿, 3=红, 4=紫/深蓝, 5=棕/暗红, 6=青, 7=黑/深灰, 8=灰
+# 运行时也会从截图学习补充
 LEARNED_NUMBER_COLORS = {}
-NUMBER_TOLERANCE = 55
+NUMBER_TOLERANCE = 50
 
 # ---------------------------------------------------------------------------
 # 全局控制
@@ -127,6 +129,84 @@ def is_opened(pixel):
 def is_red(pixel):
     r, g, b = int(pixel[0]), int(pixel[1]), int(pixel[2])
     return r > 180 and g < 100 and b < 100
+
+
+def rgb_to_hsv(r, g, b):
+    """RGB (0-255) → HSV (h: 0-360, s: 0-1, v: 0-1)"""
+    r, g, b = r / 255.0, g / 255.0, b / 255.0
+    mx = max(r, g, b)
+    mn = min(r, g, b)
+    diff = mx - mn
+    if diff == 0:
+        h = 0
+    elif mx == r:
+        h = (60 * ((g - b) / diff) + 360) % 360
+    elif mx == g:
+        h = (60 * ((b - r) / diff) + 120) % 360
+    else:
+        h = (60 * ((r - g) / diff) + 240) % 360
+    s = 0 if mx == 0 else diff / mx
+    v = mx
+    return h, s, v
+
+
+def classify_number_by_hsv(fg_pixels):
+    """
+    根据前景像素的 HSV 色相判断数字 1-8。
+    返回数字或 None。
+    """
+    if len(fg_pixels) == 0:
+        return None
+
+    fg_arr = np.array(fg_pixels, dtype=float)
+    avg_r, avg_g, avg_b = fg_arr.mean(axis=0)[:3]
+    h, s, v = rgb_to_hsv(avg_r, avg_g, avg_b)
+
+    # 低饱和度 → 灰色系 (7=深灰, 8=浅灰)
+    if s < 0.15:
+        if v < 0.45:
+            return 7  # 深灰/黑
+        else:
+            return 8  # 浅灰
+
+    # 低亮度低饱和 → 也可能是 7
+    if v < 0.25 and s < 0.3:
+        return 7
+
+    # 按色相分类
+    # 红色区域: h < 15 or h > 340
+    if h < 15 or h > 340:
+        # 红色 → 3 或 5(棕红)
+        if v < 0.55:
+            return 5  # 暗红/棕
+        return 3  # 红
+
+    # 橙色: 15-40
+    if 15 <= h < 40:
+        return 5  # 橙/棕 → 数字5
+
+    # 黄色: 40-65 (少见，可能是5的变体)
+    if 40 <= h < 65:
+        return 5
+
+    # 绿色: 65-165
+    if 65 <= h < 165:
+        return 2  # 绿
+
+    # 青色: 165-195
+    if 165 <= h < 195:
+        return 6  # 青
+
+    # 蓝色: 195-260
+    if 195 <= h < 260:
+        # 深蓝/紫蓝 → 4, 普通蓝 → 1
+        if h > 240 or s > 0.6 and v < 0.4:
+            return 4  # 紫/深蓝
+        return 1  # 蓝
+
+    # 紫色: 260-340
+    if 260 <= h <= 340:
+        return 4  # 紫
 
 
 # ---------------------------------------------------------------------------
@@ -286,100 +366,88 @@ def get_cell_region(img_array, board_x, board_y, cell_size, row, col):
 
 
 def identify_cell(img_array, board_x, board_y, cell_size, row, col):
-    """识别单个格子状态 — 使用边缘采样 + 动态颜色学习"""
+    """识别单个格子状态 — 边缘采样判断开关 + HSV色相识别数字"""
     region = get_cell_region(img_array, board_x, board_y, cell_size, row, col)
     if region.size == 0:
         return UNKNOWN
 
     h, w = region.shape[:2]
+    if h < 4 or w < 4:
+        return UNKNOWN
 
-    # 采样边缘像素（上下左右各取一行/列的中间段），避开中心装饰图标
+    # 采样边缘像素（四条边的中间段），避开中心装饰图标
     edge_pixels = []
-    mid_h, mid_w = h // 2, w // 2
-    # 上边缘
     for x in range(w // 4, 3 * w // 4):
         edge_pixels.append(region[1, x])
-    # 下边缘
-    for x in range(w // 4, 3 * w // 4):
         edge_pixels.append(region[h - 2, x])
-    # 左边缘
     for y in range(h // 4, 3 * h // 4):
         edge_pixels.append(region[y, 1])
-    # 右边缘
-    for y in range(h // 4, 3 * h // 4):
         edge_pixels.append(region[y, w - 2])
 
     if not edge_pixels:
         return UNKNOWN
 
-    edge_arr = np.array(edge_pixels, dtype=float)
-    edge_avg = edge_arr.mean(axis=0)
+    edge_avg = np.array(edge_pixels, dtype=float).mean(axis=0)
 
-    # 1. 判断是否为未打开格子（边缘颜色匹配未打开颜色）
-    unopened_match = 0
-    for ep in edge_pixels:
-        if is_unopened(ep):
-            unopened_match += 1
-    unopened_ratio = unopened_match / len(edge_pixels)
-
-    if unopened_ratio > 0.6:
+    # 1. 判断是否为未打开格子
+    unopened_match = sum(1 for ep in edge_pixels if is_unopened(ep))
+    if unopened_match / len(edge_pixels) > 0.6:
         return UNKNOWN
 
-    # 2. 已打开格子 — 判断是空白还是数字
-    # 取格子中心区域找非背景色像素（数字文本）
-    inner_margin = max(3, cell_size // 5)
-    iy1 = inner_margin
-    iy2 = h - inner_margin
-    ix1 = inner_margin
-    ix2 = w - inner_margin
+    # 2. 已打开格子 — 动态学习背景色
+    add_opened_color(edge_avg)
+
+    # 3. 在整个格子内部找前景色像素（数字文本）
+    # 用更大的内部区域，但排除最外圈
+    margin = max(2, cell_size // 8)
+    iy1, iy2 = margin, h - margin
+    ix1, ix2 = margin, w - margin
     if iy2 <= iy1 or ix2 <= ix1:
-        add_opened_color(edge_avg)
         return EMPTY
 
     inner = region[iy1:iy2, ix1:ix2]
 
-    # 动态学习已打开背景色
-    add_opened_color(edge_avg)
-
-    # 找非背景色像素（即数字文本的像素）
+    # 前景像素 = 既不是已打开背景色，也不是未打开色，且与边缘背景色差异大
     fg_pixels = []
+    bg_threshold = 30  # 与边缘背景色的最小距离
     for py in range(inner.shape[0]):
         for px in range(inner.shape[1]):
             p = inner[py, px]
-            if not is_opened(p) and not is_unopened(p):
+            dist_to_bg = color_distance(p, edge_avg)
+            if dist_to_bg > bg_threshold:
                 fg_pixels.append(p)
 
-    # 如果前景像素太少，认为是空白格
+    # 前景像素太少 → 空白格
     fg_ratio = len(fg_pixels) / max(1, inner.shape[0] * inner.shape[1])
-    if fg_ratio < 0.05:
+    if fg_ratio < 0.03:
         return EMPTY
 
-    # 3. 有前景像素 → 尝试匹配已学习的数字颜色
-    fg_arr = np.array(fg_pixels, dtype=float)
-    fg_avg = fg_arr.mean(axis=0)
+    # 4. 用 HSV 色相识别数字
+    num = classify_number_by_hsv(fg_pixels)
+    if num is not None:
+        return num
 
+    # 5. fallback: 尝试已学习的颜色
     if LEARNED_NUMBER_COLORS:
+        fg_avg = np.array(fg_pixels, dtype=float).mean(axis=0)
         best_num = None
         best_dist = NUMBER_TOLERANCE
-        for num, nc in LEARNED_NUMBER_COLORS.items():
+        for n, nc in LEARNED_NUMBER_COLORS.items():
             d = color_distance(fg_avg, nc)
             if d < best_dist:
                 best_dist = d
-                best_num = num
+                best_num = n
         if best_num is not None:
             return best_num
 
-    # 4. 未学习过的颜色 → 返回特殊标记让 learn_numbers 处理
-    # 暂时返回 EMPTY（后续 learn_numbers 会修正）
     return EMPTY
 
 
 def learn_number_colors(img_array, board_x, board_y, cell_size):
     """
-    第一次点击后，扫描已打开区域，学习数字颜色。
-    通过聚类前景色来区分不同数字。
+    第一次点击后，扫描已打开区域，用 HSV 色相识别数字并学习颜色。
     """
-    fg_clusters = []  # [(avg_color, count, positions)]
+    number_samples = defaultdict(list)  # num -> [avg_color, ...]
 
     for r in range(ROWS):
         for c in range(COLS):
@@ -387,6 +455,8 @@ def learn_number_colors(img_array, board_x, board_y, cell_size):
             if region.size == 0:
                 continue
             h, w = region.shape[:2]
+            if h < 4 or w < 4:
+                continue
 
             # 检查边缘是否为未打开
             edge_pixels = []
@@ -400,13 +470,14 @@ def learn_number_colors(img_array, board_x, board_y, cell_size):
             if unopened_count / len(edge_pixels) > 0.6:
                 continue
 
-            # 已打开格子 — 提取前景色
+            # 已打开格子 — 学习背景色
             edge_avg = np.array(edge_pixels, dtype=float).mean(axis=0)
             add_opened_color(edge_avg)
 
-            inner_margin = max(3, cell_size // 5)
-            iy1, iy2 = inner_margin, h - inner_margin
-            ix1, ix2 = inner_margin, w - inner_margin
+            # 提取前景像素
+            margin = max(2, cell_size // 8)
+            iy1, iy2 = margin, h - margin
+            ix1, ix2 = margin, w - margin
             if iy2 <= iy1 or ix2 <= ix1:
                 continue
 
@@ -415,41 +486,30 @@ def learn_number_colors(img_array, board_x, board_y, cell_size):
             for py in range(inner.shape[0]):
                 for px in range(inner.shape[1]):
                     p = inner[py, px]
-                    if not is_opened(p) and not is_unopened(p):
+                    if color_distance(p, edge_avg) > 30:
                         fg_pixels.append(p)
 
             fg_ratio = len(fg_pixels) / max(1, inner.shape[0] * inner.shape[1])
-            if fg_ratio < 0.05:
+            if fg_ratio < 0.03:
                 continue
 
-            fg_avg = np.mean(fg_pixels, axis=0)
+            # 用 HSV 识别数字
+            num = classify_number_by_hsv(fg_pixels)
+            if num is not None:
+                fg_avg = np.mean(fg_pixels, axis=0)
+                number_samples[num].append(fg_avg)
 
-            # 聚类到已有簇
-            merged = False
-            for cluster in fg_clusters:
-                if color_distance(fg_avg, cluster[0]) < 40:
-                    # 更新平均色
-                    n = cluster[1]
-                    cluster[0] = (cluster[0] * n + fg_avg) / (n + 1)
-                    cluster[1] = n + 1
-                    cluster[2].append((r, c))
-                    merged = True
-                    break
-            if not merged:
-                fg_clusters.append([fg_avg.copy(), 1, [(r, c)]])
-
-    # 按出现次数排序（数字1最常见，2次之...）
-    fg_clusters.sort(key=lambda x: -x[1])
-
-    # 分配数字：出现最多的是1，次多的是2...
-    for i, cluster in enumerate(fg_clusters):
-        num = i + 1
-        if num > 8:
-            break
-        LEARNED_NUMBER_COLORS[num] = tuple(int(v) for v in cluster[0])
-        print(f"    数字 {num}: RGB{LEARNED_NUMBER_COLORS[num]} (出现 {cluster[1]} 次)")
+    # 对每个数字取平均颜色
+    for num in sorted(number_samples.keys()):
+        avg = np.mean(number_samples[num], axis=0)
+        LEARNED_NUMBER_COLORS[num] = tuple(int(v) for v in avg)
+        print(f"    数字 {num}: RGB{LEARNED_NUMBER_COLORS[num]} (样本 {len(number_samples[num])} 个)")
 
     print(f"  共学习到 {len(LEARNED_NUMBER_COLORS)} 种数字颜色")
+    if len(OPENED_COLORS) > 0:
+        print(f"  已打开背景色: {len(OPENED_COLORS)} 种")
+        for i, oc in enumerate(OPENED_COLORS):
+            print(f"    背景{i+1}: RGB({int(oc[0])}, {int(oc[1])}, {int(oc[2])})")
 
 
 def read_board(screenshot, board_x, board_y, cell_size, known_flags=None):
@@ -465,6 +525,24 @@ def read_board(screenshot, board_x, board_y, cell_size, known_flags=None):
             row.append(val)
         board.append(row)
     return board
+
+
+def print_board_debug(board):
+    """打印棋盘状态（调试用，只在第一轮打印）"""
+    symbols = {UNKNOWN: '.', FLAGGED: 'F', EMPTY: ' '}
+    lines = []
+    for r in range(ROWS):
+        row_str = ""
+        for c in range(COLS):
+            v = board[r][c]
+            if v in symbols:
+                row_str += symbols[v]
+            else:
+                row_str += str(v)
+        lines.append(row_str)
+    print("  棋盘状态:")
+    for line in lines:
+        print(f"  |{line}|")
 
 
 # ---------------------------------------------------------------------------
@@ -749,6 +827,21 @@ def main():
 
         unknown, flagged, opened = count_states(board)
         print(f"  未知: {unknown}, 旗帜: {flagged}, 已开: {opened}")
+
+        # 统计数字分布
+        num_counts = defaultdict(int)
+        for r in range(ROWS):
+            for c in range(COLS):
+                v = board[r][c]
+                if 1 <= v <= 8:
+                    num_counts[v] += 1
+        if num_counts:
+            dist_str = ", ".join(f"{k}:{v}" for k, v in sorted(num_counts.items()))
+            print(f"  数字分布: {dist_str}")
+
+        # 前两轮打印棋盘
+        if turn <= 2:
+            print_board_debug(board)
 
         game_over, result = is_game_over(board, prev_board)
         if game_over:
