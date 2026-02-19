@@ -66,6 +66,9 @@ UNOPENED_COLORS = []   # 未打开格子的颜色（从左上角采样）
 OPENED_COLORS = []     # 已打开格子的颜色（棋盘格有深浅两种）
 COLOR_TOLERANCE = 40
 
+# OCR 结果缓存: (row, col) -> 数字 (已识别的格子不再重复 OCR)
+ocr_cache = {}
+
 
 def on_pause():
     global paused
@@ -186,21 +189,42 @@ def ocr_digit(cell_img):
     if pytesseract is None:
         return None
 
-    # 放大到固定尺寸提高识别率
-    target_size = (60, 60)
-    img = cell_img.resize(target_size, Image.LANCZOS)
+    arr = np.array(cell_img, dtype=float)
+    if arr.ndim < 3:
+        return None
 
-    # 转灰度 → 二值化（保留深色文字）
-    gray = img.convert('L')
-    # 自适应阈值：取中间值
-    arr = np.array(gray)
-    threshold = int(arr.mean() * 0.7)
-    binary = gray.point(lambda x: 0 if x < threshold else 255, '1')
+    h, w = arr.shape[:2]
+
+    # 1. 计算边缘背景色（取四条边像素的平均值）
+    edge_pixels = []
+    for x in range(w):
+        edge_pixels.append(arr[0, x])
+        edge_pixels.append(arr[h - 1, x])
+    for y in range(h):
+        edge_pixels.append(arr[y, 0])
+        edge_pixels.append(arr[y, w - 1])
+    bg_color = np.mean(edge_pixels, axis=0)
+
+    # 2. 计算每个像素与背景色的距离，生成前景 mask
+    diff = np.sqrt(np.sum((arr - bg_color) ** 2, axis=2))
+    # 阈值：距离背景色超过 35 的认为是前景（数字笔画）
+    fg_mask = (diff > 35).astype(np.uint8) * 255
+
+    # 3. 转为 PIL 图像，放大到 120x120 提高识别率
+    mask_img = Image.fromarray(fg_mask, mode='L')
+    # 反转：Tesseract 需要黑字白底
+    mask_img = Image.fromarray(255 - fg_mask, mode='L')
+    target_size = (120, 120)
+    mask_img = mask_img.resize(target_size, Image.NEAREST)
+
+    # 4. 加白色边框（Tesseract 需要文字周围有空白）
+    padded = Image.new('L', (140, 140), 255)
+    padded.paste(mask_img, (10, 10))
 
     # OCR — 只识别单个字符，限定为数字
     try:
         text = pytesseract.image_to_string(
-            binary,
+            padded,
             config='--psm 10 -c tessedit_char_whitelist=12345678'
         ).strip()
     except Exception:
@@ -369,6 +393,10 @@ def get_cell_region(img_array, board_x, board_y, cell_size, row, col):
 
 def identify_cell(img_array, board_x, board_y, cell_size, row, col, pil_screenshot=None):
     """识别单个格子状态 — 边缘采样判断开关 + OCR 识别数字"""
+    # 如果缓存中已有该格子的数字，直接返回（数字格不会变）
+    if (row, col) in ocr_cache:
+        return ocr_cache[(row, col)]
+
     region = get_cell_region(img_array, board_x, board_y, cell_size, row, col)
     if region.size == 0:
         return UNKNOWN
@@ -404,7 +432,9 @@ def identify_cell(img_array, board_x, board_y, cell_size, row, col, pil_screensh
     iy1, iy2 = margin, h - margin
     ix1, ix2 = margin, w - margin
     if iy2 <= iy1 or ix2 <= ix1:
-        return EMPTY
+        result = EMPTY
+        ocr_cache[(row, col)] = result
+        return result
 
     inner = region[iy1:iy2, ix1:ix2]
     fg_count = 0
@@ -415,7 +445,9 @@ def identify_cell(img_array, board_x, board_y, cell_size, row, col, pil_screensh
                 fg_count += 1
 
     if fg_count / max(1, total) < 0.03:
-        return EMPTY
+        result = EMPTY
+        ocr_cache[(row, col)] = result
+        return result
 
     # 4. 有前景像素 → OCR 识别数字
     if pil_screenshot is not None:
@@ -426,6 +458,7 @@ def identify_cell(img_array, board_x, board_y, cell_size, row, col, pil_screensh
         cell_img = pil_screenshot.crop((x1, y1_abs, x2, y2_abs))
         num = ocr_digit(cell_img)
         if num is not None:
+            ocr_cache[(row, col)] = num
             return num
 
     return EMPTY
