@@ -17,14 +17,27 @@ jobs:
           python-version: "3.11"
           architecture: x64
 
+      - name: Install Tesseract OCR
+        run: |
+          choco install tesseract -y --no-progress
+          $env:PATH = "C:\Program Files\Tesseract-OCR;$env:PATH"
+          tesseract --version
+
       - name: Install dependencies
         run: pip install -r requirements.txt
 
       - name: Build exe
-        run: pyinstaller --onefile minesweeper_bot.py
+        run: |
+          pyinstaller --onefile minesweeper_bot.py
 
-      - name: Upload exe
+      - name: Package Tesseract with exe
+        run: |
+          Copy-Item -Recurse "C:\Program Files\Tesseract-OCR" dist\Tesseract-OCR
+
+      - name: Upload exe with Tesseract
         uses: actions/upload-artifact@v4
         with:
           name: minesweeper_bot
-          path: dist/minesweeper_bot.exe
+          path: |
+            dist/minesweeper_bot.exe
+            dist/Tesseract-OCR/

@@ -23,7 +23,12 @@ from collections import defaultdict
 
 import pyautogui
 import numpy as np
-from PIL import ImageGrab, ImageDraw
+from PIL import ImageGrab, ImageDraw, Image, ImageFilter
+
+try:
+    import pytesseract
+except ImportError:
+    pytesseract = None
 
 try:
     import keyboard
@@ -45,12 +50,8 @@ EMPTY = 0
 pyautogui.PAUSE = 0.02
 pyautogui.FAILSAFE = True
 
-# 数字颜色 — 用 HSV 色相范围识别，适配各种主题
-# 扫雷数字颜色在不同主题中色相基本一致:
-#   1=蓝, 2=绿, 3=红, 4=紫/深蓝, 5=棕/暗红, 6=青, 7=黑/深灰, 8=灰
-# 运行时也会从截图学习补充
-LEARNED_NUMBER_COLORS = {}
-NUMBER_TOLERANCE = 50
+# Tesseract 路径（打包时会放在同目录）
+TESSERACT_PATH = None
 
 # ---------------------------------------------------------------------------
 # 全局控制
@@ -131,82 +132,82 @@ def is_red(pixel):
     return r > 180 and g < 100 and b < 100
 
 
-def rgb_to_hsv(r, g, b):
-    """RGB (0-255) → HSV (h: 0-360, s: 0-1, v: 0-1)"""
-    r, g, b = r / 255.0, g / 255.0, b / 255.0
-    mx = max(r, g, b)
-    mn = min(r, g, b)
-    diff = mx - mn
-    if diff == 0:
-        h = 0
-    elif mx == r:
-        h = (60 * ((g - b) / diff) + 360) % 360
-    elif mx == g:
-        h = (60 * ((b - r) / diff) + 120) % 360
+def setup_tesseract():
+    """查找并配置 Tesseract 路径"""
+    global TESSERACT_PATH
+    if pytesseract is None:
+        print("错误: 需要 pytesseract 库。请运行 pip install pytesseract")
+        sys.exit(1)
+
+    # 打包后的 exe 同目录下
+    if getattr(sys, 'frozen', False):
+        base = os.path.dirname(sys.executable)
     else:
-        h = (60 * ((r - g) / diff) + 240) % 360
-    s = 0 if mx == 0 else diff / mx
-    v = mx
-    return h, s, v
+        base = os.path.dirname(os.path.abspath(__file__))
+
+    candidates = [
+        os.path.join(base, 'tesseract', 'tesseract.exe'),
+        os.path.join(base, 'Tesseract-OCR', 'tesseract.exe'),
+        r'C:\Program Files\Tesseract-OCR\tesseract.exe',
+        r'C:\Program Files (x86)\Tesseract-OCR\tesseract.exe',
+        'tesseract',  # PATH 中
+    ]
+
+    for path in candidates:
+        if os.path.isfile(path):
+            TESSERACT_PATH = path
+            pytesseract.pytesseract.tesseract_cmd = path
+            print(f"  Tesseract: {path}")
+            return True
+
+    # 尝试直接调用（可能在 PATH 中）
+    try:
+        pytesseract.pytesseract.tesseract_cmd = 'tesseract'
+        pytesseract.get_tesseract_version()
+        TESSERACT_PATH = 'tesseract'
+        print("  Tesseract: 系统 PATH")
+        return True
+    except Exception:
+        pass
+
+    print("错误: 找不到 Tesseract OCR。")
+    print("请安装 Tesseract: https://github.com/tesseract-ocr/tesseract")
+    print("或将 tesseract.exe 放在程序同目录的 Tesseract-OCR 文件夹中。")
+    sys.exit(1)
 
 
-def classify_number_by_hsv(fg_pixels):
+def ocr_digit(cell_img):
     """
-    根据前景像素的 HSV 色相判断数字 1-8。
-    返回数字或 None。
+    对单个格子图片做 OCR，识别数字 1-8。
+    cell_img: PIL Image (已裁剪的格子区域)
+    返回数字 1-8 或 None
     """
-    if len(fg_pixels) == 0:
+    if pytesseract is None:
         return None
 
-    fg_arr = np.array(fg_pixels, dtype=float)
-    avg_r, avg_g, avg_b = fg_arr.mean(axis=0)[:3]
-    h, s, v = rgb_to_hsv(avg_r, avg_g, avg_b)
+    # 放大到固定尺寸提高识别率
+    target_size = (60, 60)
+    img = cell_img.resize(target_size, Image.LANCZOS)
 
-    # 低饱和度 → 灰色系 (7=深灰, 8=浅灰)
-    if s < 0.15:
-        if v < 0.45:
-            return 7  # 深灰/黑
-        else:
-            return 8  # 浅灰
+    # 转灰度 → 二值化（保留深色文字）
+    gray = img.convert('L')
+    # 自适应阈值：取中间值
+    arr = np.array(gray)
+    threshold = int(arr.mean() * 0.7)
+    binary = gray.point(lambda x: 0 if x < threshold else 255, '1')
 
-    # 低亮度低饱和 → 也可能是 7
-    if v < 0.25 and s < 0.3:
-        return 7
+    # OCR — 只识别单个字符，限定为数字
+    try:
+        text = pytesseract.image_to_string(
+            binary,
+            config='--psm 10 -c tessedit_char_whitelist=12345678'
+        ).strip()
+    except Exception:
+        return None
 
-    # 按色相分类
-    # 红色区域: h < 15 or h > 340
-    if h < 15 or h > 340:
-        # 红色 → 3 或 5(棕红)
-        if v < 0.55:
-            return 5  # 暗红/棕
-        return 3  # 红
-
-    # 橙色: 15-40
-    if 15 <= h < 40:
-        return 5  # 橙/棕 → 数字5
-
-    # 黄色: 40-65 (少见，可能是5的变体)
-    if 40 <= h < 65:
-        return 5
-
-    # 绿色: 65-165
-    if 65 <= h < 165:
-        return 2  # 绿
-
-    # 青色: 165-195
-    if 165 <= h < 195:
-        return 6  # 青
-
-    # 蓝色: 195-260
-    if 195 <= h < 260:
-        # 深蓝/紫蓝 → 4, 普通蓝 → 1
-        if h > 240 or s > 0.6 and v < 0.4:
-            return 4  # 紫/深蓝
-        return 1  # 蓝
-
-    # 紫色: 260-340
-    if 260 <= h <= 340:
-        return 4  # 紫
+    if text and text[0] in '12345678':
+        return int(text[0])
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -365,8 +366,8 @@ def get_cell_region(img_array, board_x, board_y, cell_size, row, col):
     return img_array[y1:y2, x1:x2]
 
 
-def identify_cell(img_array, board_x, board_y, cell_size, row, col):
-    """识别单个格子状态 — 边缘采样判断开关 + HSV色相识别数字"""
+def identify_cell(img_array, board_x, board_y, cell_size, row, col, pil_screenshot=None):
+    """识别单个格子状态 — 边缘采样判断开关 + OCR 识别数字"""
     region = get_cell_region(img_array, board_x, board_y, cell_size, row, col)
     if region.size == 0:
         return UNKNOWN
@@ -375,7 +376,7 @@ def identify_cell(img_array, board_x, board_y, cell_size, row, col):
     if h < 4 or w < 4:
         return UNKNOWN
 
-    # 采样边缘像素（四条边的中间段），避开中心装饰图标
+    # 采样边缘像素
     edge_pixels = []
     for x in range(w // 4, 3 * w // 4):
         edge_pixels.append(region[1, x])
@@ -397,8 +398,7 @@ def identify_cell(img_array, board_x, board_y, cell_size, row, col):
     # 2. 已打开格子 — 动态学习背景色
     add_opened_color(edge_avg)
 
-    # 3. 在整个格子内部找前景色像素（数字文本）
-    # 用更大的内部区域，但排除最外圈
+    # 3. 检查是否有前景像素（数字文本）
     margin = max(2, cell_size // 8)
     iy1, iy2 = margin, h - margin
     ix1, ix2 = margin, w - margin
@@ -406,110 +406,28 @@ def identify_cell(img_array, board_x, board_y, cell_size, row, col):
         return EMPTY
 
     inner = region[iy1:iy2, ix1:ix2]
-
-    # 前景像素 = 既不是已打开背景色，也不是未打开色，且与边缘背景色差异大
-    fg_pixels = []
-    bg_threshold = 30  # 与边缘背景色的最小距离
+    fg_count = 0
+    total = inner.shape[0] * inner.shape[1]
     for py in range(inner.shape[0]):
         for px in range(inner.shape[1]):
-            p = inner[py, px]
-            dist_to_bg = color_distance(p, edge_avg)
-            if dist_to_bg > bg_threshold:
-                fg_pixels.append(p)
+            if color_distance(inner[py, px], edge_avg) > 30:
+                fg_count += 1
 
-    # 前景像素太少 → 空白格
-    fg_ratio = len(fg_pixels) / max(1, inner.shape[0] * inner.shape[1])
-    if fg_ratio < 0.03:
+    if fg_count / max(1, total) < 0.03:
         return EMPTY
 
-    # 4. 用 HSV 色相识别数字
-    num = classify_number_by_hsv(fg_pixels)
-    if num is not None:
-        return num
-
-    # 5. fallback: 尝试已学习的颜色
-    if LEARNED_NUMBER_COLORS:
-        fg_avg = np.array(fg_pixels, dtype=float).mean(axis=0)
-        best_num = None
-        best_dist = NUMBER_TOLERANCE
-        for n, nc in LEARNED_NUMBER_COLORS.items():
-            d = color_distance(fg_avg, nc)
-            if d < best_dist:
-                best_dist = d
-                best_num = n
-        if best_num is not None:
-            return best_num
+    # 4. 有前景像素 → OCR 识别数字
+    if pil_screenshot is not None:
+        x1 = board_x + col * cell_size + 2
+        y1_abs = board_y + row * cell_size + 2
+        x2 = x1 + cell_size - 4
+        y2_abs = y1_abs + cell_size - 4
+        cell_img = pil_screenshot.crop((x1, y1_abs, x2, y2_abs))
+        num = ocr_digit(cell_img)
+        if num is not None:
+            return num
 
     return EMPTY
-
-
-def learn_number_colors(img_array, board_x, board_y, cell_size):
-    """
-    第一次点击后，扫描已打开区域，用 HSV 色相识别数字并学习颜色。
-    """
-    number_samples = defaultdict(list)  # num -> [avg_color, ...]
-
-    for r in range(ROWS):
-        for c in range(COLS):
-            region = get_cell_region(img_array, board_x, board_y, cell_size, r, c)
-            if region.size == 0:
-                continue
-            h, w = region.shape[:2]
-            if h < 4 or w < 4:
-                continue
-
-            # 检查边缘是否为未打开
-            edge_pixels = []
-            for x in range(w // 4, 3 * w // 4):
-                if 1 < h - 2:
-                    edge_pixels.append(region[1, x])
-                    edge_pixels.append(region[h - 2, x])
-            if not edge_pixels:
-                continue
-            unopened_count = sum(1 for ep in edge_pixels if is_unopened(ep))
-            if unopened_count / len(edge_pixels) > 0.6:
-                continue
-
-            # 已打开格子 — 学习背景色
-            edge_avg = np.array(edge_pixels, dtype=float).mean(axis=0)
-            add_opened_color(edge_avg)
-
-            # 提取前景像素
-            margin = max(2, cell_size // 8)
-            iy1, iy2 = margin, h - margin
-            ix1, ix2 = margin, w - margin
-            if iy2 <= iy1 or ix2 <= ix1:
-                continue
-
-            inner = region[iy1:iy2, ix1:ix2]
-            fg_pixels = []
-            for py in range(inner.shape[0]):
-                for px in range(inner.shape[1]):
-                    p = inner[py, px]
-                    if color_distance(p, edge_avg) > 30:
-                        fg_pixels.append(p)
-
-            fg_ratio = len(fg_pixels) / max(1, inner.shape[0] * inner.shape[1])
-            if fg_ratio < 0.03:
-                continue
-
-            # 用 HSV 识别数字
-            num = classify_number_by_hsv(fg_pixels)
-            if num is not None:
-                fg_avg = np.mean(fg_pixels, axis=0)
-                number_samples[num].append(fg_avg)
-
-    # 对每个数字取平均颜色
-    for num in sorted(number_samples.keys()):
-        avg = np.mean(number_samples[num], axis=0)
-        LEARNED_NUMBER_COLORS[num] = tuple(int(v) for v in avg)
-        print(f"    数字 {num}: RGB{LEARNED_NUMBER_COLORS[num]} (样本 {len(number_samples[num])} 个)")
-
-    print(f"  共学习到 {len(LEARNED_NUMBER_COLORS)} 种数字颜色")
-    if len(OPENED_COLORS) > 0:
-        print(f"  已打开背景色: {len(OPENED_COLORS)} 种")
-        for i, oc in enumerate(OPENED_COLORS):
-            print(f"    背景{i+1}: RGB({int(oc[0])}, {int(oc[1])}, {int(oc[2])})")
 
 
 def read_board(screenshot, board_x, board_y, cell_size, known_flags=None):
@@ -519,7 +437,7 @@ def read_board(screenshot, board_x, board_y, cell_size, known_flags=None):
     for r in range(ROWS):
         row = []
         for c in range(COLS):
-            val = identify_cell(img, board_x, board_y, cell_size, r, c)
+            val = identify_cell(img, board_x, board_y, cell_size, r, c, pil_screenshot=screenshot)
             if known_flags and (r, c) in known_flags and val == UNKNOWN:
                 val = FLAGGED
             row.append(val)
@@ -758,6 +676,7 @@ def main():
     print()
 
     setup_hotkeys()
+    setup_tesseract()
     print()
     print("请先打开扫雷，开始一局高级模式新游戏（不要点任何格子）。")
     print()
@@ -795,14 +714,8 @@ def main():
     click_cell(board_x, board_y, cell_size, center_r, center_c, button='left')
     time.sleep(0.8)
 
-    # 点击后重新截图，学习已打开格子的颜色和数字颜色
-    print()
-    print("[2.5] 学习颜色...")
-    time.sleep(0.3)
-    screenshot2 = ImageGrab.grab()
-    img2 = np.array(screenshot2)
-    learn_number_colors(img2, board_x, board_y, cell_size)
-    save_debug_image(screenshot2, board_x, board_y, cell_size)
+    # 点击后等待动画
+    time.sleep(0.5)
 
     prev_board = None
     turn = 0

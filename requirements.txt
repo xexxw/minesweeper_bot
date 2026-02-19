@@ -2,4 +2,5 @@ pyautogui
 Pillow
 numpy
 keyboard
+pytesseract
 pyinstaller
