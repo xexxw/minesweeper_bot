@@ -18,12 +18,11 @@ Minesweeper Bot — Windows 11 Microsoft Minesweeper 自动化
 import time
 import sys
 import os
-import itertools
 from collections import defaultdict
 
 import pyautogui
 import numpy as np
-from PIL import ImageGrab, ImageDraw, Image, ImageFilter
+from PIL import ImageGrab, ImageDraw, Image
 
 try:
     import pytesseract
@@ -211,7 +210,6 @@ def ocr_digit(cell_img):
     fg_mask = (diff > 35).astype(np.uint8) * 255
 
     # 3. 转为 PIL 图像，放大到 120x120 提高识别率
-    mask_img = Image.fromarray(fg_mask, mode='L')
     # 反转：Tesseract 需要黑字白底
     mask_img = Image.fromarray(255 - fg_mask, mode='L')
     target_size = (120, 120)
